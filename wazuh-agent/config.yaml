@@ -1,38 +1,37 @@
 name: "Wazuh Agent"
-version: "0.1.7"
-slug: "wazuh_agent"
 description: "Wazuh Agent for forwarding Home Assistant logs to a Wazuh Manager."
+version: "0.1.8"
+slug: "wazuh_agent"
+init: false
+
 arch:
   - amd64
   - aarch64
   - armv7
-init: false
+
 startup: services
 boot: auto
-ingress: false
-host_network: false
-privileged: []
-map:
-  - config:ro
-  - ssl:ro
-  - share:ro
 
-  # journald access (HAOS / 2025.11+)
-  - /run/log/journal:ro
-  - /var/log/journal:ro
-  - /etc/machine-id:ro
 options:
-  manager_address: "192.168.1.39"
+  manager_address: ""
   agent_name: "home-assistant"
-  agent_group: ""        # opcionalno
+  agent_group: ""
   enrollment_port: 1515
   communication_port: 1514
-  enrollment_key: ""     # obavezno (UI će tražiti)
+  enrollment_key: ""
 
 schema:
   manager_address: str
   agent_name: str
-  agent_group: "str?"    # ✅ opcionalno (nema zvjezdice)
+  agent_group: str?
   enrollment_port: int
   communication_port: int
-  enrollment_key: str    # ✅ obavezno (ima zvjezdicu)
+  enrollment_key: str
+
+map:
+  - config:ro
+  - ssl:ro
+  - share:ro
+  - /run/log/journal:ro
+  - /var/log/journal:ro
+  - /etc/machine-id:ro
