@@ -14,8 +14,13 @@ host_network: false
 privileged: []
 map:
   - config:ro
-  - share:ro
   - ssl:ro
+  - share:ro
+
+  # journald access (HAOS / 2025.11+)
+  - /run/log/journal:ro
+  - /var/log/journal:ro
+  - /etc/machine-id:ro
 options:
   manager_address: "192.168.1.39"
   agent_name: "home-assistant"
