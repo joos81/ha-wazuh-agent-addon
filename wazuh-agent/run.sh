@@ -73,7 +73,7 @@ BEGIN { in_server=0 }
 # ------------------------------------------------------------
 
 for tag in syscheck rootcheck sca syscollector; do
-  sed -i "s|<${tag}>|<${tag}><disabled>yes</disabled>|" "$CONF" 2>/dev/null || true
+  sed -i "s|<${tag}>|<${tag}><disabled>yes</disabled>|" "$CONF"
 done
 
 # ------------------------------------------------------------
