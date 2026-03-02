@@ -9,11 +9,10 @@ OPTS="/data/options.json"
 CONF="/var/ossec/etc/ossec.conf"
 KEYS="/var/ossec/etc/client.keys"
 
-# Persist inside addon data (maps to /addon_configs/<slug>/ on host)
+# Persist inside add-on data (maps to host add-on data)
 PERSIST_DIR="/data/ossec/etc"
 PERSIST_KEYS="${PERSIST_DIR}/client.keys"
 
-# Optional HA file log (usually not present)
 LOGFILE="/config/home-assistant.log"
 
 # ----------------------------
@@ -45,9 +44,9 @@ if [[ -z "$MANAGER_ADDRESS" ]]; then log "ERROR: manager_address missing"; exit 
 if [[ -z "$AGENT_NAME" ]]; then log "ERROR: agent_name missing"; exit 1; fi
 if [[ -z "$ENROLLMENT_KEY" ]]; then log "ERROR: enrollment_key missing"; exit 1; fi
 
-# Ensure base config exists
+# Ensure config exists
 if [[ ! -f "$CONF" ]]; then
-  log "ERROR: ossec.conf not found at $CONF (wazuh-agent package broken?)"
+  log "ERROR: ossec.conf not found at $CONF"
   exit 1
 fi
 
@@ -61,33 +60,19 @@ if [[ "$FORCE_REENROLL" == "true" ]]; then
   rm -f "$PERSIST_KEYS"
 fi
 
-# ----------------------------
-# Link client.keys -> persisted
-# ----------------------------
-# If a real keys file exists and persisted is empty, seed it once.
-if [[ -f "$KEYS" && ! -L "$KEYS" && ! -s "$PERSIST_KEYS" ]]; then
-  cp -f "$KEYS" "$PERSIST_KEYS" || true
-fi
-
-rm -f "$KEYS"
-ln -s "$PERSIST_KEYS" "$KEYS"
-
+# Ensure persisted file exists (may be empty)
 touch "$PERSIST_KEYS"
 chmod 640 "$PERSIST_KEYS" || true
-# group 'wazuh' exists after package install; ignore if not
 chown root:wazuh "$PERSIST_KEYS" 2>/dev/null || true
 
 # ----------------------------
-# Set manager address + comm port
+# Apply manager address + comm port
 # ----------------------------
-# Replace first <address>...</address>
 sed -i "0,/<address>.*<\/address>/{s|<address>.*</address>|<address>${MANAGER_ADDRESS}</address>|}" "$CONF" || true
-# Replace common default 1514 port line if present
 sed -i "s|<port>1514</port>|<port>${COMM_PORT}</port>|" "$CONF" || true
 
 # ----------------------------
-# Ensure NO auto-enrollment block
-# (prevents wazuh-agentd from enrolling again without password)
+# Remove <enrollment> block (avoid agentd auto-enrolling without password)
 # ----------------------------
 if grep -q "<enrollment>" "$CONF"; then
   log "Removing <enrollment> block from ossec.conf (avoid auto-enroll)"
@@ -100,9 +85,7 @@ if grep -q "<enrollment>" "$CONF"; then
 fi
 
 # ----------------------------
-# Add HA log source
-# Prefer file if exists, else journald
-# Journald should include <location>journald</location> to avoid warnings
+# Add HA log source (file if exists, otherwise journald)
 # ----------------------------
 if grep -q "WAZUH-HA" "$CONF"; then
   log "HA localfile already present"
@@ -137,46 +120,51 @@ else
 fi
 
 # ----------------------------
-# Enrollment (ONLY if persisted keys empty)
+# KEY HANDLING (NO SYMLINK!)
+# 1) If persisted keys exist -> copy into /var/ossec/etc/client.keys
+# 2) Else enroll -> client.keys will be created in /var/ossec/etc -> copy to persisted
 # ----------------------------
-if [[ ! -s "$PERSIST_KEYS" ]]; then
+
+if [[ -s "$PERSIST_KEYS" ]]; then
+  log "Persisted client.keys exists; restoring into /var/ossec/etc/client.keys"
+  cp -f "$PERSIST_KEYS" "$KEYS"
+  chmod 640 "$KEYS" || true
+  chown root:wazuh "$KEYS" 2>/dev/null || true
+else
   log "No persisted client.keys; enrolling now"
+
   if [[ -n "$AGENT_GROUP" ]]; then
     /var/ossec/bin/agent-auth -m "$MANAGER_ADDRESS" -p "$ENROLLMENT_PORT" -A "$AGENT_NAME" -G "$AGENT_GROUP" -P "$ENROLLMENT_KEY"
   else
     /var/ossec/bin/agent-auth -m "$MANAGER_ADDRESS" -p "$ENROLLMENT_PORT" -A "$AGENT_NAME" -P "$ENROLLMENT_KEY"
   fi
 
-  # Verify keys actually exist (symlink target)
-  if [[ -s "$PERSIST_KEYS" ]]; then
-    log "Enrollment complete; client.keys persisted"
+  if [[ -s "$KEYS" ]]; then
+    log "Enrollment complete; persisting client.keys"
+    cp -f "$KEYS" "$PERSIST_KEYS"
+    chmod 640 "$PERSIST_KEYS" || true
+    chown root:wazuh "$PERSIST_KEYS" 2>/dev/null || true
   else
-    log "ERROR: Enrollment reported success but persisted client.keys is missing/empty."
-    log "DEBUG: KEYS points to: $(readlink -f "$KEYS" || true)"
-    log "DEBUG: listing /var/ossec/etc:"
-    ls -la /var/ossec/etc || true
-    log "DEBUG: listing $PERSIST_DIR:"
-    ls -la "$PERSIST_DIR" || true
+    log "ERROR: Enrollment reported success but /var/ossec/etc/client.keys is missing/empty."
     exit 1
   fi
-else
-  log "Persisted client.keys exists; skipping enrollment"
 fi
 
 # ----------------------------
-# Debug dump (so you can get ossec.conf without container access)
+# Debug dump (prints to add-on logs)
 # ----------------------------
 if [[ "$DEBUG_DUMP" == "true" ]]; then
-  log "DEBUG DUMP: ossec.conf (first 220 lines)"
-  sed -n '1,220p' "$CONF" || true
-  log "DEBUG DUMP: ossec.conf (last 120 lines)"
-  tail -n 120 "$CONF" || true
-
-  log "DEBUG DUMP: keys + storage"
-  log "KEYS symlink: $(ls -la "$KEYS" 2>/dev/null || true)"
-  log "PERSIST_KEYS: $(ls -la "$PERSIST_KEYS" 2>/dev/null || true)"
-  log "PERSIST_DIR:"
+  log "DEBUG: /var/ossec/etc/client.keys:"
+  ls -la "$KEYS" || true
+  log "DEBUG: persisted client.keys:"
+  ls -la "$PERSIST_KEYS" || true
+  log "DEBUG: /data/ossec/etc listing:"
   ls -la "$PERSIST_DIR" || true
+
+  log "DEBUG: ossec.conf first 200 lines"
+  sed -n '1,200p' "$CONF" || true
+  log "DEBUG: ossec.conf last 120 lines"
+  tail -n 120 "$CONF" || true
 fi
 
 # ----------------------------
