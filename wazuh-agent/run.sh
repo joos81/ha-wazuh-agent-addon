@@ -5,11 +5,15 @@ export DEBIAN_FRONTEND=noninteractive
 echo "[wazuh-agent] Starting"
 
 OPTS="/data/options.json"
+
 CONF="/var/ossec/etc/ossec.conf"
 KEYS="/var/ossec/etc/client.keys"
 
-PERSIST_DIR="/data/ossec/etc"
+# Add-on persistent area (survives reinstall unless user wipes data)
+ADDON_DATA="/data"
+PERSIST_DIR="${ADDON_DATA}/ossec/etc"
 PERSIST_KEYS="${PERSIST_DIR}/client.keys"
+DEBUG_DIR="${ADDON_DATA}/debug"
 
 LOGFILE="/config/home-assistant.log"
 
@@ -61,34 +65,24 @@ if [ ! -f "$CONF" ]; then
 fi
 
 # ----------------------------
-# Persist dir + optional force reenroll
+# Prepare persistent folders
 # ----------------------------
 mkdir -p "$PERSIST_DIR"
+mkdir -p "$DEBUG_DIR"
 
+# ----------------------------
+# Force re-enroll wipes persisted keys + runtime keys
+# ----------------------------
 if [ "$FORCE_REENROLL" = "true" ]; then
-  echo "[wazuh-agent] Force re-enroll enabled: wiping persisted client.keys"
+  echo "[wazuh-agent] Force re-enroll enabled: wiping persisted and runtime client.keys"
   rm -f "$PERSIST_KEYS"
+  rm -f "$KEYS"
 fi
 
 # ----------------------------
-# Link client.keys -> persisted
+# Ensure manager address/port
 # ----------------------------
-# If there is a real file already and persisted doesn't exist yet, seed it once.
-if [ -f "$KEYS" ] && [ ! -L "$KEYS" ] && [ ! -s "$PERSIST_KEYS" ]; then
-  cp -f "$KEYS" "$PERSIST_KEYS" || true
-fi
-
-rm -f "$KEYS"
-ln -s "$PERSIST_KEYS" "$KEYS"
-
-touch "$PERSIST_KEYS"
-chmod 640 "$PERSIST_KEYS" || true
-chown root:wazuh "$PERSIST_KEYS" 2>/dev/null || true
-
-# ----------------------------
-# Set manager address and comm port
-# ----------------------------
-# Replace the first <address> in the config
+# Replace FIRST <address>...</address>
 sed -i "0,/<address>.*<\/address>/{s|<address>.*<\/address>|<address>${MANAGER_ADDRESS}</address>|}" "$CONF" || true
 # Replace default 1514 if present
 sed -i "s|<port>1514</port>|<port>${COMM_PORT}</port>|" "$CONF" || true
@@ -98,7 +92,6 @@ sed -i "s|<port>1514</port>|<port>${COMM_PORT}</port>|" "$CONF" || true
 # ----------------------------
 for tag in syscheck rootcheck syscollector; do
   if grep -q "<${tag}>" "$CONF"; then
-    # if <disabled> exists inside the block, flip it; else inject it after opening tag
     if awk "/<${tag}>/{f=1} f&&/<disabled>/{print; exit} /<\/${tag}>/{f=0}" "$CONF" | grep -q "<disabled>"; then
       sed -i "0,/<${tag}>/{s/<disabled>no<\/disabled>/<disabled>yes<\/disabled>/}" "$CONF" || true
     else
@@ -111,8 +104,9 @@ for tag in syscheck rootcheck syscollector; do
 done
 
 # ----------------------------
-# Add HA log source (file if exists, else journald)
-# Journald: include <location>journald</location> to avoid warnings
+# Add HA log source
+# Prefer file if exists, otherwise journald
+# Journald: add <location>journald</location>
 # ----------------------------
 if grep -q "WAZUH-HA" "$CONF"; then
   echo "[wazuh-agent] HA localfile already present"
@@ -147,10 +141,11 @@ else
 fi
 
 # ----------------------------
-# Disable auto-enrollment block in ossec.conf (prevents agentd re-enroll w/o password)
+# CRITICAL: Remove <enrollment> block from ossec.conf
+# Prevents agentd from trying to enroll again without password (and random name)
 # ----------------------------
 if grep -q "<enrollment>" "$CONF"; then
-  echo "[wazuh-agent] Disabling <enrollment> block in ossec.conf"
+  echo "[wazuh-agent] Removing <enrollment> block from ossec.conf"
   awk '
     BEGIN{skip=0}
     /<enrollment>/{skip=1; next}
@@ -160,11 +155,14 @@ if grep -q "<enrollment>" "$CONF"; then
 fi
 
 # ----------------------------
-# Enrollment (ONLY if persisted keys empty)
+# If persisted keys exist -> restore to runtime
 # ----------------------------
-if [ ! -s "$PERSIST_KEYS" ]; then
-  echo "[wazuh-agent] No persisted client.keys; enrolling and capturing keys"
-  echo "[wazuh-agent] Performing enrollment"
+if [ -s "$PERSIST_KEYS" ]; then
+  echo "[wazuh-agent] Persisted client.keys exists; restoring to runtime"
+  cp -f "$PERSIST_KEYS" "$KEYS"
+else
+  echo "[wazuh-agent] No persisted client.keys; performing enrollment"
+  rm -f "$KEYS"
 
   if [ -n "$AGENT_GROUP" ]; then
     /var/ossec/bin/agent-auth -m "$MANAGER_ADDRESS" -p "$ENROLLMENT_PORT" -A "$AGENT_NAME" -G "$AGENT_GROUP" -P "$ENROLLMENT_KEY"
@@ -172,28 +170,31 @@ if [ ! -s "$PERSIST_KEYS" ]; then
     /var/ossec/bin/agent-auth -m "$MANAGER_ADDRESS" -p "$ENROLLMENT_PORT" -A "$AGENT_NAME" -P "$ENROLLMENT_KEY"
   fi
 
-  if [ -s "$PERSIST_KEYS" ]; then
+  # After agent-auth, runtime keys MUST exist and be non-empty
+  if [ -s "$KEYS" ]; then
+    cp -f "$KEYS" "$PERSIST_KEYS"
     echo "[wazuh-agent] Enrollment complete; client.keys persisted"
   else
-    echo "[wazuh-agent] ERROR: Enrollment reported success but persisted client.keys is missing/empty."
+    echo "[wazuh-agent] ERROR: Enrollment reported success but /var/ossec/etc/client.keys is missing/empty."
+    echo "[wazuh-agent] This usually means agent-auth couldn't write keys inside container."
     exit 1
   fi
-else
-  echo "[wazuh-agent] Persisted client.keys exists; skipping enrollment"
 fi
 
 # ----------------------------
-# Debug: dump config for support (so you can share it without docker attach)
+# Debug dump to /data (host-readable at /data/addons/data/<slug>/debug/)
 # ----------------------------
 if [ "$DEBUG_DUMP" = "true" ]; then
-  mkdir -p /share/wazuh-agent || true
-  cp -f "$CONF" /share/wazuh-agent/ossec.conf || true
-  cp -f "$PERSIST_KEYS" /share/wazuh-agent/client.keys.redacted 2>/dev/null || true
-  # Redact keys file if copied (avoid leaking secrets)
-  if [ -f /share/wazuh-agent/client.keys.redacted ]; then
-    sed -i 's/^\([0-9]\+\) \([^ ]\+\) .*/\1 \2 **REDACTED**/' /share/wazuh-agent/client.keys.redacted || true
+  cp -f "$CONF" "${DEBUG_DIR}/ossec.conf" || true
+  cp -f "$CONF" "${DEBUG_DIR}/ossec.conf.bak" 2>/dev/null || true
+
+  # redact keys before dumping (avoid secrets leak)
+  if [ -f "$PERSIST_KEYS" ]; then
+    cp -f "$PERSIST_KEYS" "${DEBUG_DIR}/client.keys.redacted" || true
+    sed -i 's/^\([0-9]\+\) \([^ ]\+\) .*/\1 \2 **REDACTED**/' "${DEBUG_DIR}/client.keys.redacted" || true
   fi
-  echo "[wazuh-agent] Debug dump written to /share/wazuh-agent/"
+
+  echo "[wazuh-agent] Debug written to ${DEBUG_DIR} (host: /data/addons/data/<slug>/debug/)"
 fi
 
 # ----------------------------
