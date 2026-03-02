@@ -7,12 +7,119 @@ log() { echo "[wazuh-agent] $*"; }
 OPTS="/data/options.json"
 
 CONF="/var/ossec/etc/ossec.conf"
-KEYS="/var/ossec/etc/client.keys"
+LIVE_KEYS="/var/ossec/etc/client.keys"
 
 PERSIST_DIR="/data/ossec/etc"
 PERSIST_KEYS="${PERSIST_DIR}/client.keys"
 
 LOGFILE="/config/home-assistant.log"
+
+# ----------------------------
+# Helpers
+# ----------------------------
+jq_str() {
+  local key="$1"
+  local val
+  val="$(jq -r "$key" "$OPTS" 2>/dev/null || true)"
+  [[ "$val" == "null" ]] && echo "" || echo "$val"
+}
+
+is_port() {
+  local p="$1"
+  [[ "$p" =~ ^[0-9]+$ ]] || return 1
+  (( p >= 1 && p <= 65535 )) || return 1
+  return 0
+}
+
+# Disable/enable <syscheck> / <rootcheck> blocks safely
+set_disabled_simple_block() {
+  local tag="$1"
+  local want_disabled="$2" # "yes" or "no"
+
+  if ! grep -q "<${tag}>" "$CONF"; then
+    return 0
+  fi
+
+  # If <disabled> exists in the block, replace first occurrence
+  if awk "/<${tag}>/{f=1} f&&/<disabled>/{print; exit} /<\/${tag}>/{f=0}" "$CONF" | grep -q "<disabled>"; then
+    # replace first disabled inside the block
+    awk -v t="$tag" -v v="$want_disabled" '
+      BEGIN{f=0;done=0}
+      $0 ~ "<"t">" {f=1}
+      f && !done && $0 ~ /<disabled>/ {
+        gsub(/<disabled>[^<]*<\/disabled>/, "<disabled>"v"</disabled>")
+        done=1
+      }
+      $0 ~ "</"t">" {f=0}
+      {print}
+    ' "$CONF" > /tmp/ossec.conf && mv /tmp/ossec.conf "$CONF"
+  else
+    # inject <disabled> right after opening tag
+    awk -v t="$tag" -v v="$want_disabled" '
+      $0 ~ "<"t">" && !done {
+        print
+        print "    <disabled>"v"</disabled>"
+        done=1
+        next
+      }
+      { print }
+    ' "$CONF" > /tmp/ossec.conf && mv /tmp/ossec.conf "$CONF"
+  fi
+}
+
+# Disable syscollector whether it appears as <syscollector> or <wodle name="syscollector">
+disable_syscollector_any_shape() {
+  # Case A: <syscollector>...</syscollector> (older-ish layouts)
+  if grep -q "<syscollector>" "$CONF"; then
+    set_disabled_simple_block "syscollector" "yes"
+  fi
+
+  # Case B: <wodle name="syscollector">...</wodle>
+  if grep -q '<wodle name="syscollector">' "$CONF"; then
+    # If <disabled> exists within that wodle, replace it; otherwise inject.
+    if awk '/<wodle name="syscollector">/{f=1} f&&/<disabled>/{print; exit} /<\/wodle>/{f=0}' "$CONF" | grep -q "<disabled>"; then
+      awk '
+        BEGIN{f=0;done=0}
+        /<wodle name="syscollector">/{f=1}
+        f && !done && /<disabled>/{
+          gsub(/<disabled>[^<]*<\/disabled>/, "<disabled>yes</disabled>")
+          done=1
+        }
+        /<\/wodle>/{f=0}
+        {print}
+      ' "$CONF" > /tmp/ossec.conf && mv /tmp/ossec.conf "$CONF"
+    else
+      awk '
+        /<wodle name="syscollector">/ && !done {
+          print
+          print "    <disabled>yes</disabled>"
+          done=1
+          next
+        }
+        {print}
+      ' "$CONF" > /tmp/ossec.conf && mv /tmp/ossec.conf "$CONF"
+    fi
+  fi
+}
+
+# Remove default "command" localfile collectors (df/netstat/last) — they are noisy in containers
+remove_command_collectors() {
+  # Remove any <localfile> that contains <command>
+  awk '
+    BEGIN{inlf=0;buf="";hascmd=0}
+    /<localfile>/{inlf=1;buf=$0"\n";hascmd=0;next}
+    inlf{
+      buf=buf $0"\n"
+      if ($0 ~ /<command>/) hascmd=1
+      if ($0 ~ /<\/localfile>/){
+        if (!hascmd) printf "%s", buf
+        inlf=0;buf="";hascmd=0
+      }
+      next
+    }
+    {print}
+  ' "$CONF" > /tmp/ossec.conf && mv /tmp/ossec.conf "$CONF"
+}
 
 # ----------------------------
 # Read options
@@ -21,18 +128,6 @@ if [[ ! -f "$OPTS" ]]; then
   log "ERROR: options.json not found"
   exit 1
 fi
-
-# Helper: jq -> string, trims null/empty
-jq_str() {
-  local key="$1"
-  local val
-  val="$(jq -r "$key" "$OPTS" 2>/dev/null || true)"
-  if [[ "$val" == "null" ]]; then
-    echo ""
-  else
-    echo "$val"
-  fi
-}
 
 MANAGER_ADDRESS="$(jq_str '.manager_address')"
 AGENT_NAME="$(jq_str '.agent_name')"
@@ -44,6 +139,7 @@ COMM_PORT="$(jq -r '.communication_port // 1514' "$OPTS")"
 ENROLLMENT_KEY="$(jq_str '.enrollment_key')"
 FORCE_REENROLL="$(jq -r '.force_reenroll // false' "$OPTS")"
 DEBUG_DUMP="$(jq -r '.debug_dump_config // false' "$OPTS")"
+SECURITY_PROFILE="$(jq -r '.security_profile // "minimal"' "$OPTS")"
 
 log "Starting"
 log "manager=$MANAGER_ADDRESS agent=$AGENT_NAME"
@@ -51,53 +147,28 @@ log "enrollment_port=$ENROLLMENT_PORT comm_port=$COMM_PORT"
 log "enrollment_key_set=$([[ -n "$ENROLLMENT_KEY" ]] && echo yes || echo no)"
 log "agent_group=$AGENT_GROUP"
 log "force_reenroll=$FORCE_REENROLL debug_dump_config=$DEBUG_DUMP"
+log "security_profile=$SECURITY_PROFILE"
 
 # ----------------------------
-# Required checks (prod)
+# Validation
 # ----------------------------
-if [[ -z "$MANAGER_ADDRESS" ]]; then
-  log "ERROR: manager_address missing"
-  exit 1
-fi
-if [[ -z "$AGENT_NAME" ]]; then
-  log "ERROR: agent_name missing"
-  exit 1
-fi
-if [[ -z "$ENROLLMENT_KEY" ]]; then
-  log "ERROR: enrollment_key missing"
-  exit 1
-fi
+[[ -n "$MANAGER_ADDRESS" ]] || { log "ERROR: manager_address missing"; exit 1; }
+[[ -n "$AGENT_NAME" ]] || { log "ERROR: agent_name missing"; exit 1; }
+[[ -n "$ENROLLMENT_KEY" ]] || { log "ERROR: enrollment_key missing"; exit 1; }
+
+is_port "$ENROLLMENT_PORT" || { log "ERROR: enrollment_port must be 1..65535 (got: $ENROLLMENT_PORT)"; exit 1; }
+is_port "$COMM_PORT" || { log "ERROR: communication_port must be 1..65535 (got: $COMM_PORT)"; exit 1; }
 
 # ----------------------------
-# Port validation
-# ----------------------------
-is_port() {
-  local p="$1"
-  [[ "$p" =~ ^[0-9]+$ ]] || return 1
-  (( p >= 1 && p <= 65535 )) || return 1
-  return 0
-}
-
-if ! is_port "$ENROLLMENT_PORT"; then
-  log "ERROR: enrollment_port must be 1..65535 (got: $ENROLLMENT_PORT)"
-  exit 1
-fi
-if ! is_port "$COMM_PORT"; then
-  log "ERROR: communication_port must be 1..65535 (got: $COMM_PORT)"
-  exit 1
-fi
-
-# ----------------------------
-# Ensure Wazuh agent exists (installed in image)
+# Sanity: wazuh installed
 # ----------------------------
 if [[ ! -x /var/ossec/bin/wazuh-control ]] || [[ ! -f "$CONF" ]]; then
-  log "ERROR: Wazuh agent not present. (Expected /var/ossec/bin/wazuh-control and $CONF)"
-  log "This image should include wazuh-agent. Rebuild the add-on."
+  log "ERROR: Wazuh agent not present. Rebuild image (Dockerfile installs wazuh-agent)."
   exit 1
 fi
 
 # ----------------------------
-# Persist dir + optional force reenroll
+# Persisted keys handling (copy, not symlink)
 # ----------------------------
 mkdir -p "$PERSIST_DIR"
 
@@ -106,35 +177,25 @@ if [[ "$FORCE_REENROLL" == "true" ]]; then
   rm -f "$PERSIST_KEYS"
 fi
 
-# Ensure persisted file exists with sane perms
 touch "$PERSIST_KEYS"
 chmod 640 "$PERSIST_KEYS" || true
 chown root:wazuh "$PERSIST_KEYS" 2>/dev/null || true
 
-# ----------------------------
-# If persisted keys exist, restore into live KEYS
-# If not, we'll enroll and then copy from live -> persisted
-# (NO symlink; avoid weirdness on HA /data mounts)
-# ----------------------------
 if [[ -s "$PERSIST_KEYS" ]]; then
-  log "Persisted client.keys exists; restoring into $KEYS"
-  cp -f "$PERSIST_KEYS" "$KEYS" || true
-  chmod 640 "$KEYS" || true
-  chown root:wazuh "$KEYS" 2>/dev/null || true
+  log "Persisted client.keys exists; restoring into $LIVE_KEYS"
+  cp -f "$PERSIST_KEYS" "$LIVE_KEYS" || true
+  chmod 640 "$LIVE_KEYS" || true
+  chown root:wazuh "$LIVE_KEYS" 2>/dev/null || true
 fi
 
 # ----------------------------
-# Set manager address/port for communication
+# Manager address/port
 # ----------------------------
-# Replace first <address>...</address>
 sed -i "0,/<address>.*<\/address>/{s|<address>.*</address>|<address>${MANAGER_ADDRESS}</address>|}" "$CONF" || true
-
-# Replace first <port>...</port> if present; if not present, we do nothing (safe)
 sed -i "0,/<port>[0-9]\+<\/port>/{s|<port>[0-9]\+</port>|<port>${COMM_PORT}</port>|}" "$CONF" || true
 
 # ----------------------------
-# Add HA log source (file if exists, else journald)
-# Journald requires <location>journald</location> to avoid warnings
+# Add HA log source (file or journald)
 # ----------------------------
 if grep -q "WAZUH-HA" "$CONF"; then
   log "HA localfile already present"
@@ -169,8 +230,7 @@ else
 fi
 
 # ----------------------------
-# Disable auto-enrollment block in ossec.conf (critical)
-# Otherwise wazuh-agentd can attempt enroll with no password/hostname agent name
+# Disable auto-enrollment block (critical)
 # ----------------------------
 if grep -q "<enrollment>" "$CONF"; then
   log "Disabling <enrollment> block in ossec.conf"
@@ -183,7 +243,20 @@ if grep -q "<enrollment>" "$CONF"; then
 fi
 
 # ----------------------------
-# Enrollment only if no persisted keys (and live keys empty)
+# Apply security profile
+# minimal: keep SCA (don’t touch), disable noisy host modules + command collectors
+# full: do nothing
+# ----------------------------
+if [[ "$SECURITY_PROFILE" == "minimal" ]]; then
+  log "Applying minimal security profile: disable syscheck/rootcheck/syscollector + command collectors"
+  set_disabled_simple_block "syscheck" "yes"
+  set_disabled_simple_block "rootcheck" "yes"
+  disable_syscollector_any_shape
+  remove_command_collectors
+fi
+
+# ----------------------------
+# Enrollment if no persisted keys
 # ----------------------------
 if [[ ! -s "$PERSIST_KEYS" ]]; then
   log "No persisted client.keys; enrolling now"
@@ -194,9 +267,9 @@ if [[ ! -s "$PERSIST_KEYS" ]]; then
     /var/ossec/bin/agent-auth -m "$MANAGER_ADDRESS" -p "$ENROLLMENT_PORT" -A "$AGENT_NAME" -P "$ENROLLMENT_KEY"
   fi
 
-  if [[ -s "$KEYS" ]]; then
+  if [[ -s "$LIVE_KEYS" ]]; then
     log "Enrollment complete; persisting client.keys"
-    cp -f "$KEYS" "$PERSIST_KEYS" || true
+    cp -f "$LIVE_KEYS" "$PERSIST_KEYS" || true
     chmod 640 "$PERSIST_KEYS" || true
     chown root:wazuh "$PERSIST_KEYS" 2>/dev/null || true
   else
@@ -206,22 +279,15 @@ if [[ ! -s "$PERSIST_KEYS" ]]; then
 fi
 
 # ----------------------------
-# Optional debug dump (log-visible; no container attach needed)
+# Debug dump
 # ----------------------------
 if [[ "$DEBUG_DUMP" == "true" ]]; then
-  log "DEBUG: options.json:"
-  cat "$OPTS" || true
-
-  log "DEBUG: persisted keys:"
-  ls -la "$PERSIST_DIR" || true
+  log "DEBUG: persisted keys size:"
   wc -c "$PERSIST_KEYS" 2>/dev/null || true
-
-  log "DEBUG: live /var/ossec/etc:"
-  ls -la /var/ossec/etc || true
-  wc -c "$KEYS" 2>/dev/null || true
-
+  log "DEBUG: live keys size:"
+  wc -c "$LIVE_KEYS" 2>/dev/null || true
   log "DEBUG: ossec.conf key lines:"
-  grep -nE "WAZUH-HA|<localfile>|journald|<address>|<port>|<enrollment>" "$CONF" || true
+  grep -nE "WAZUH-HA|<localfile>|journald|<address>|<port>|<enrollment>|<syscheck>|<rootcheck>|syscollector|<command>" "$CONF" || true
 fi
 
 # ----------------------------
