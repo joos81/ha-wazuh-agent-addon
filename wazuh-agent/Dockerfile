@@ -1,23 +1,22 @@
-ARG BUILD_FROM
+ARG BUILD_FROM=ghcr.io/home-assistant/amd64-base-debian:bookworm
 FROM ${BUILD_FROM}
 
-ARG BUILD_ARCH
-ARG BUILD_VERSION
-
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
-     ca-certificates curl gnupg jq \
+     curl ca-certificates gnupg jq systemd \
   && rm -rf /var/lib/apt/lists/*
 
-# Wazuh repo key + repo (non-interactive safe)
-RUN curl -fsSL https://packages.wazuh.com/key/GPG-KEY-WAZUH \
-    | gpg --batch --yes --dearmor -o /usr/share/keyrings/wazuh.gpg \
+# Wazuh repo key + repo (non-interactive)
+RUN curl -fsSL https://packages.wazuh.com/key/GPG-KEY-WAZUH -o /tmp/wazuh.key \
+  && gpg --batch --yes --dearmor -o /usr/share/keyrings/wazuh.gpg /tmp/wazuh.key \
+  && rm -f /tmp/wazuh.key \
   && echo "deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt stable main" \
-    > /etc/apt/sources.list.d/wazuh.list
+     > /etc/apt/sources.list.d/wazuh.list
 
-# Install wazuh-agent in the image (NO apt on startup)
+# Install wazuh-agent at build time (no runtime apt noise)
 RUN apt-get update \
   && apt-get install -y --no-install-recommends wazuh-agent \
   && rm -rf /var/lib/apt/lists/*
@@ -25,4 +24,4 @@ RUN apt-get update \
 COPY run.sh /run.sh
 RUN chmod +x /run.sh
 
-CMD ["/run.sh"]
+CMD [ "/run.sh" ]
