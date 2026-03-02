@@ -4,77 +4,92 @@ set -euo pipefail
 echo "[wazuh-agent] Starting"
 
 OPTS="/data/options.json"
+CONF="/var/ossec/etc/ossec.conf"
+LOGFILE="/config/home-assistant.log"
+
 if [ ! -f "$OPTS" ]; then
-  echo "[wazuh-agent] ERROR: options.json not found at $OPTS"
+  echo "[wazuh-agent] ERROR: options.json not found"
   exit 1
 fi
 
-echo "[wazuh-agent] Raw options:"
-cat "$OPTS" || true
-
 MANAGER_ADDRESS="$(jq -r '.manager_address' "$OPTS")"
 AGENT_NAME="$(jq -r '.agent_name' "$OPTS")"
-AGENT_GROUP="$(jq -r '.agent_group // ""' "$OPTS")"        # ✅ optional
+AGENT_GROUP="$(jq -r '.agent_group // ""' "$OPTS")"
 ENROLLMENT_PORT="$(jq -r '.enrollment_port' "$OPTS")"
-COMM_PORT="$(jq -r '.communication_port' "$OPTS")"
-ENROLLMENT_KEY="$(jq -r '.enrollment_key' "$OPTS")"        # ✅ required
+ENROLLMENT_KEY="$(jq -r '.enrollment_key' "$OPTS")"
 
 echo "[wazuh-agent] manager_address=$MANAGER_ADDRESS"
 echo "[wazuh-agent] agent_name=$AGENT_NAME"
 echo "[wazuh-agent] agent_group=$AGENT_GROUP"
-echo "[wazuh-agent] enrollment_port=$ENROLLMENT_PORT comm_port=$COMM_PORT"
+echo "[wazuh-agent] enrollment_port=$ENROLLMENT_PORT"
 echo "[wazuh-agent] enrollment_key_set=$([ -n "$ENROLLMENT_KEY" ] && echo yes || echo no)"
 
-# Required validations
+# Required
 if [ -z "$MANAGER_ADDRESS" ] || [ "$MANAGER_ADDRESS" = "null" ]; then
-  echo "[wazuh-agent] ERROR: manager_address is missing"
+  echo "[wazuh-agent] ERROR: manager_address missing"
   exit 1
 fi
 if [ -z "$AGENT_NAME" ] || [ "$AGENT_NAME" = "null" ]; then
-  echo "[wazuh-agent] ERROR: agent_name is missing"
+  echo "[wazuh-agent] ERROR: agent_name missing"
   exit 1
 fi
 if [ -z "$ENROLLMENT_KEY" ] || [ "$ENROLLMENT_KEY" = "null" ]; then
-  echo "[wazuh-agent] ERROR: enrollment_key is missing"
+  echo "[wazuh-agent] ERROR: enrollment_key missing"
   exit 1
 fi
 
-# deps (should be in image, but safe)
-export DEBIAN_FRONTEND=noninteractive
-apt-get update
-apt-get install -y --no-install-recommends curl ca-certificates gnupg jq
-rm -rf /var/lib/apt/lists/*
-
-# install agent if needed
-if [ ! -x /var/ossec/bin/wazuh-control ]; then
-  echo "[wazuh-agent] Installing Wazuh Agent..."
-  curl -s https://packages.wazuh.com/key/GPG-KEY-WAZUH | gpg --dearmor -o /usr/share/keyrings/wazuh.gpg
-  echo "deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt/ stable main" > /etc/apt/sources.list.d/wazuh.list
-  apt-get update
-  apt-get install -y wazuh-agent
-  rm -rf /var/lib/apt/lists/*
-else
-  echo "[wazuh-agent] Wazuh Agent already installed"
-fi
-
-# best-effort manager address update
-CONF="/var/ossec/etc/ossec.conf"
+# Ensure manager address in config (best-effort)
 if [ -f "$CONF" ]; then
-  echo "[wazuh-agent] Updating ossec.conf manager address..."
   sed -i "s|<address>.*</address>|<address>${MANAGER_ADDRESS}</address>|" "$CONF" || true
 fi
 
-echo "[wazuh-agent] Running agent enrollment..."
-if [ -n "$AGENT_GROUP" ]; then
-  echo "[wazuh-agent] Enrolling with group: $AGENT_GROUP"
-  /var/ossec/bin/agent-auth -m "$MANAGER_ADDRESS" -p "$ENROLLMENT_PORT" -A "$AGENT_NAME" -G "$AGENT_GROUP" -P "$ENROLLMENT_KEY"
+# --- C-mode: disable noisy modules (container != host) ---
+# Disable syscheck/rootcheck/sca (idempotent edits)
+# If blocks exist, flip to no; if not, we don't force-add them here (keeps minimal edits).
+for tag in syscheck rootcheck sca; do
+  if grep -q "<${tag}>" "$CONF"; then
+    sed -i "0,/<${tag}>/{s/<disabled>no<\/disabled>/<disabled>yes<\/disabled>/}" "$CONF" || true
+  fi
+done
+
+# --- Add HA log localfile (idempotent) ---
+if [ -f "$LOGFILE" ]; then
+  if ! grep -q "$LOGFILE" "$CONF"; then
+    echo "[wazuh-agent] Adding localfile for $LOGFILE"
+    # Insert before closing tag
+    awk -v lf="$LOGFILE" '
+      /<\/ossec_config>/ && !done {
+        print "  <localfile>";
+        print "    <log_format>syslog</log_format>";
+        print "    <location>" lf "</location>";
+        print "  </localfile>";
+        done=1
+      }
+      { print }
+    ' "$CONF" > /tmp/ossec.conf && mv /tmp/ossec.conf "$CONF"
+  else
+    echo "[wazuh-agent] localfile already present"
+  fi
 else
-  echo "[wazuh-agent] Enrolling without group"
-  /var/ossec/bin/agent-auth -m "$MANAGER_ADDRESS" -p "$ENROLLMENT_PORT" -A "$AGENT_NAME" -P "$ENROLLMENT_KEY"
+  echo "[wazuh-agent] WARNING: $LOGFILE not found (HA log not present yet)"
 fi
 
-echo "[wazuh-agent] Starting Wazuh agent..."
-/var/ossec/bin/wazuh-control start || true
+# --- Enrollment only if client.keys is missing/empty ---
+KEYS="/var/ossec/etc/client.keys"
+if [ ! -s "$KEYS" ]; then
+  echo "[wazuh-agent] Enrolling agent (no client.keys yet)..."
+  if [ -n "$AGENT_GROUP" ]; then
+    /var/ossec/bin/agent-auth -m "$MANAGER_ADDRESS" -p "$ENROLLMENT_PORT" -A "$AGENT_NAME" -G "$AGENT_GROUP" -P "$ENROLLMENT_KEY"
+  else
+    /var/ossec/bin/agent-auth -m "$MANAGER_ADDRESS" -p "$ENROLLMENT_PORT" -A "$AGENT_NAME" -P "$ENROLLMENT_KEY"
+  fi
+else
+  echo "[wazuh-agent] client.keys exists; skipping enrollment"
+fi
+
+echo "[wazuh-agent] Restarting Wazuh agent..."
+/var/ossec/bin/wazuh-control restart || /var/ossec/bin/wazuh-control start || true
 /var/ossec/bin/wazuh-control status || true
 
+echo "[wazuh-agent] Tailing agent log..."
 tail -f /var/ossec/logs/ossec.log
