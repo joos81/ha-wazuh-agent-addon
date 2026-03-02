@@ -4,7 +4,6 @@ set -euo pipefail
 echo "[wazuh-agent] Starting"
 
 OPTS="/data/options.json"
-CONF="/var/ossec/etc/ossec.conf"
 LOGFILE="/config/home-assistant.log"
 PERSIST_DIR="/data/ossec/etc"
 PERSIST_KEYS="${PERSIST_DIR}/client.keys"
@@ -42,18 +41,34 @@ if [ -z "$ENROLLMENT_KEY" ] || [ "$ENROLLMENT_KEY" = "null" ]; then
 fi
 
 # -------------------------------------------------
-# Ensure manager address
+# INSTALL WAZUH AGENT FIRST
 # -------------------------------------------------
-if [ -f "$CONF" ]; then
-  sed -i "s|<address>.*</address>|<address>${MANAGER_ADDRESS}</address>|" "$CONF" || true
+if [ ! -d "/var/ossec" ]; then
+  echo "[wazuh-agent] Installing Wazuh agent..."
+
+  apt-get update
+  apt-get install -y curl ca-certificates gnupg jq
+
+  curl -s https://packages.wazuh.com/key/GPG-KEY-WAZUH | gpg --dearmor -o /usr/share/keyrings/wazuh.gpg
+  echo "deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt stable main" > /etc/apt/sources.list.d/wazuh.list
+
+  apt-get update
+  apt-get install -y wazuh-agent
 fi
 
+CONF="/var/ossec/etc/ossec.conf"
+
 # -------------------------------------------------
-# Disable host-specific modules (container != host)
+# Patch manager address
+# -------------------------------------------------
+sed -i "s|<address>.*</address>|<address>${MANAGER_ADDRESS}</address>|" "$CONF"
+
+# -------------------------------------------------
+# Disable host-specific modules
 # -------------------------------------------------
 for tag in syscheck rootcheck; do
   if grep -q "<${tag}>" "$CONF"; then
-    sed -i "0,/<${tag}>/{s/<disabled>no<\/disabled>/<disabled>yes<\/disabled>/}" "$CONF" || true
+    sed -i "0,/<${tag}>/{s/<disabled>no<\/disabled>/<disabled>yes<\/disabled>/}" "$CONF"
   fi
 done
 
@@ -75,8 +90,7 @@ if [ -f "$LOGFILE" ]; then
     ' "$CONF" > /tmp/ossec.conf && mv /tmp/ossec.conf "$CONF"
   fi
 else
-  echo "[wazuh-agent] No HA log file found, using journald"
-
+  echo "[wazuh-agent] Using journald for HA logs"
   if ! grep -q "CONTAINER_NAME=homeassistant" "$CONF"; then
     awk '
       /<\/ossec_config>/ && !done {
@@ -92,7 +106,7 @@ else
 fi
 
 # -------------------------------------------------
-# Persist client.keys
+# Persist keys
 # -------------------------------------------------
 mkdir -p "$PERSIST_DIR"
 
@@ -104,7 +118,7 @@ rm -f /var/ossec/etc/client.keys
 ln -sf "$PERSIST_KEYS" /var/ossec/etc/client.keys
 
 # -------------------------------------------------
-# Enrollment only if no persistent key
+# Enrollment only if no key
 # -------------------------------------------------
 if [ ! -s "$PERSIST_KEYS" ]; then
   echo "[wazuh-agent] Enrolling agent..."
