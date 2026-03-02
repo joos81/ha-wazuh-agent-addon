@@ -1,21 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export DEBIAN_FRONTEND=noninteractive
 
 echo "[wazuh-agent] Starting"
 
 OPTS="/data/options.json"
+
 CONF="/var/ossec/etc/ossec.conf"
+KEYS="/var/ossec/etc/client.keys"
 
 PERSIST_DIR="/data/ossec/etc"
 PERSIST_KEYS="${PERSIST_DIR}/client.keys"
 
-KEYS="/var/ossec/etc/client.keys"
+LOGFILE="/config/home-assistant.log"
 
-# -----------------------------
+# ----------------------------
 # Read options
-# -----------------------------
+# ----------------------------
 if [ ! -f "$OPTS" ]; then
-  echo "[wazuh-agent] ERROR: options.json not found at $OPTS"
+  echo "[wazuh-agent] ERROR: options.json not found"
   exit 1
 fi
 
@@ -27,149 +30,192 @@ COMM_PORT="$(jq -r '.communication_port // 1514' "$OPTS")"
 ENROLLMENT_KEY="$(jq -r '.enrollment_key // empty' "$OPTS")"
 FORCE_REENROLL="$(jq -r '.force_reenroll // false' "$OPTS")"
 
-echo "[wazuh-agent] manager=${MANAGER_ADDRESS} agent=${AGENT_NAME}"
-echo "[wazuh-agent] enrollment_port=${ENROLLMENT_PORT} comm_port=${COMM_PORT}"
-echo "[wazuh-agent] enrollment_key_set=$([ -n "${ENROLLMENT_KEY}" ] && echo yes || echo no)"
-echo "[wazuh-agent] agent_group=${AGENT_GROUP:-}"
-echo "[wazuh-agent] force_reenroll=${FORCE_REENROLL}"
+echo "[wazuh-agent] manager=$MANAGER_ADDRESS agent=$AGENT_NAME"
+echo "[wazuh-agent] enrollment_port=$ENROLLMENT_PORT comm_port=$COMM_PORT"
+echo "[wazuh-agent] enrollment_key_set=$([ -n "$ENROLLMENT_KEY" ] && echo yes || echo no)"
+echo "[wazuh-agent] agent_group=$AGENT_GROUP"
+echo "[wazuh-agent] force_reenroll=$FORCE_REENROLL"
 
-# -----------------------------
-# Required checks
-# -----------------------------
+# Required checks (prod)
 if [ -z "$MANAGER_ADDRESS" ]; then
-  echo "[wazuh-agent] ERROR: manager_address is required"
+  echo "[wazuh-agent] ERROR: manager_address missing"
   exit 1
 fi
 if [ -z "$AGENT_NAME" ]; then
-  echo "[wazuh-agent] ERROR: agent_name is required"
+  echo "[wazuh-agent] ERROR: agent_name missing"
   exit 1
 fi
 if [ -z "$ENROLLMENT_KEY" ]; then
-  echo "[wazuh-agent] ERROR: enrollment_key is required"
+  echo "[wazuh-agent] ERROR: enrollment_key missing"
   exit 1
 fi
 
-# -----------------------------
-# Validate Wazuh install
-# -----------------------------
+# ----------------------------
+# Install Wazuh agent if missing
+# ----------------------------
+if [ ! -d /var/ossec ] || [ ! -x /var/ossec/bin/wazuh-control ]; then
+  echo "[wazuh-agent] Installing Wazuh agent..."
+
+  apt-get update
+  apt-get install -y --no-install-recommends curl ca-certificates gnupg jq
+  rm -rf /var/lib/apt/lists/*
+
+  # Wazuh repo key (NON-interactive)
+  curl -fsSL https://packages.wazuh.com/key/GPG-KEY-WAZUH -o /tmp/wazuh.key
+  gpg --batch --yes --dearmor -o /usr/share/keyrings/wazuh.gpg /tmp/wazuh.key
+  rm -f /tmp/wazuh.key
+
+  echo "deb [signed-by=/usr/share/keyrings/wazuh.gpg] https://packages.wazuh.com/4.x/apt stable main" \
+    > /etc/apt/sources.list.d/wazuh.list
+
+  apt-get update
+  apt-get install -y --no-install-recommends wazuh-agent
+  rm -rf /var/lib/apt/lists/*
+fi
+
+# ----------------------------
+# Ensure config exists
+# ----------------------------
 if [ ! -f "$CONF" ]; then
-  echo "[wazuh-agent] ERROR: $CONF not found. wazuh-agent install looks broken."
+  echo "[wazuh-agent] ERROR: ossec.conf not found at $CONF"
   exit 1
 fi
 
-# -----------------------------
-# Ensure persistence dir exists
-# -----------------------------
+# ----------------------------
+# Persist dir + optional force reenroll
+# ----------------------------
 mkdir -p "$PERSIST_DIR"
 
-# Optional: force re-enrollment (wipe persisted keys)
 if [ "$FORCE_REENROLL" = "true" ]; then
   echo "[wazuh-agent] Force re-enroll enabled: wiping persisted client.keys"
   rm -f "$PERSIST_KEYS"
 fi
 
-# -----------------------------
-# Ensure manager address/ports
-# -----------------------------
+# ----------------------------
+# Link client.keys -> persisted
+# ----------------------------
+# If there is a real file already and persisted doesn't exist yet, seed it once.
+if [ -f "$KEYS" ] && [ ! -L "$KEYS" ] && [ ! -s "$PERSIST_KEYS" ]; then
+  cp -f "$KEYS" "$PERSIST_KEYS" || true
+fi
+
+rm -f "$KEYS"
+ln -s "$PERSIST_KEYS" "$KEYS"
+
+# Make sure permissions are sane (Wazuh expects restricted file)
+touch "$PERSIST_KEYS"
+chmod 640 "$PERSIST_KEYS" || true
+chown root:wazuh "$PERSIST_KEYS" 2>/dev/null || true
+
+# ----------------------------
+# Set manager address/port for communication (1514)
+# ----------------------------
+# Replace first <address>...</address> and (optionally) port if present
 sed -i "s|<address>.*</address>|<address>${MANAGER_ADDRESS}</address>|" "$CONF" || true
-sed -i "s|<port>.*</port>|<port>${COMM_PORT}</port>|" "$CONF" || true
+sed -i "s|<port>1514</port>|<port>${COMM_PORT}</port>|" "$CONF" || true
 
-# -----------------------------
-# SELF-HEAL: remove invalid <disabled> inside <sca>...</sca>
-# -----------------------------
-if awk 'BEGIN{sca=0;bad=0}
-  /<sca>/{sca=1}
-  sca && /<disabled>/{bad=1}
-  /<\/sca>/{sca=0}
-  END{exit(bad?0:1)}' "$CONF"; then
-  echo "[wazuh-agent] Detected invalid <disabled> inside <sca>. Removing it (self-heal)."
-  awk '
-    BEGIN{sca=0}
-    /<sca>/{sca=1}
-    sca && /<disabled>/{next}
-    /<\/sca>/{sca=0}
-    {print}
-  ' "$CONF" > /tmp/ossec.conf && mv /tmp/ossec.conf "$CONF"
+# ----------------------------
+# Disable container-noise modules (safe default)
+# NOTE: DO NOT touch <sca> like <disabled> for versions where it's not valid.
+# We'll only disable syscheck/rootcheck/syscollector safely.
+# ----------------------------
+for tag in syscheck rootcheck syscollector; do
+  if grep -q "<${tag}>" "$CONF"; then
+    # if a <disabled> exists under that block, flip it; otherwise inject disabled yes right after opening tag
+    if awk "/<${tag}>/{f=1} f&&/<disabled>/{print; exit} /<\/${tag}>/{f=0}" "$CONF" | grep -q "<disabled>"; then
+      sed -i "0,/<${tag}>/{s/<disabled>no<\/disabled>/<disabled>yes<\/disabled>/}" "$CONF" || true
+    else
+      awk -v t="$tag" '
+        $0 ~ "<"t">" && !done[t] { print; print "    <disabled>yes</disabled>"; done[t]=1; next }
+        { print }
+      ' "$CONF" > /tmp/ossec.conf && mv /tmp/ossec.conf "$CONF"
+    fi
+  fi
+done
+
+# ----------------------------
+# Add HA log source
+# Prefer file if exists, otherwise journald
+# Journald needs <location>journald</location> to avoid warnings
+# ----------------------------
+if grep -q "WAZUH-HA" "$CONF"; then
+  echo "[wazuh-agent] HA localfile already present"
+else
+  if [ -f "$LOGFILE" ]; then
+    echo "[wazuh-agent] Using file log source: $LOGFILE"
+    awk -v lf="$LOGFILE" '
+      /<\/ossec_config>/ && !done {
+        print "  <!-- WAZUH-HA: Home Assistant log file -->"
+        print "  <localfile>"
+        print "    <log_format>syslog</log_format>"
+        print "    <location>" lf "</location>"
+        print "  </localfile>"
+        done=1
+      }
+      { print }
+    ' "$CONF" > /tmp/ossec.conf && mv /tmp/ossec.conf "$CONF"
+  else
+    echo "[wazuh-agent] Using journald log source"
+    awk '
+      /<\/ossec_config>/ && !done {
+        print "  <!-- WAZUH-HA: Home Assistant journald -->"
+        print "  <localfile>"
+        print "    <log_format>journald</log_format>"
+        print "    <location>journald</location>"
+        print "  </localfile>"
+        done=1
+      }
+      { print }
+    ' "$CONF" > /tmp/ossec.conf && mv /tmp/ossec.conf "$CONF"
+  fi
 fi
 
-# -----------------------------
-# Ensure journald localfile source (idempotent)
-# -----------------------------
-if grep -q "<log_format>journald</log_format>" "$CONF"; then
-  echo "[wazuh-agent] Journald localfile already present"
-else
-  echo "[wazuh-agent] Adding journald localfile source"
-  awk '
-    /<\/ossec_config>/ && !done {
-      print "  <localfile>";
-      print "    <log_format>journald</log_format>";
-      print "    <location>journald</location>";
-      print "  </localfile>";
-      done=1
-    }
-    { print }
-  ' "$CONF" > /tmp/ossec.conf && mv /tmp/ossec.conf "$CONF"
-fi
-
-# -----------------------------
-# Key handling (PRODUCTION FIX):
-# - If persisted keys exist: ensure symlink and skip enrollment
-# - Else: enrollment writes to a REAL file at /var/ossec/etc/client.keys
-#   then we copy to persisted location, then create symlink
-# -----------------------------
-
-if [ -s "$PERSIST_KEYS" ]; then
-  echo "[wazuh-agent] Persisted client.keys found; using it and skipping enrollment"
-  rm -f "$KEYS"
-  ln -s "$PERSIST_KEYS" "$KEYS"
-else
+# ----------------------------
+# Enrollment (ONLY if persisted keys empty)
+# ----------------------------
+if [ ! -s "$PERSIST_KEYS" ]; then
   echo "[wazuh-agent] No persisted client.keys; enrolling and capturing keys"
-
-  # IMPORTANT: do NOT symlink before enrollment
-  rm -f "$KEYS"
-  : > "$KEYS"
-  chmod 600 "$KEYS" || true
-
   echo "[wazuh-agent] Performing enrollment"
-  set +e
+
   if [ -n "$AGENT_GROUP" ]; then
     /var/ossec/bin/agent-auth -m "$MANAGER_ADDRESS" -p "$ENROLLMENT_PORT" -A "$AGENT_NAME" -G "$AGENT_GROUP" -P "$ENROLLMENT_KEY"
   else
     /var/ossec/bin/agent-auth -m "$MANAGER_ADDRESS" -p "$ENROLLMENT_PORT" -A "$AGENT_NAME" -P "$ENROLLMENT_KEY"
   fi
-  ENROLL_RC=$?
-  set -e
 
-  if [ $ENROLL_RC -ne 0 ]; then
-    echo "[wazuh-agent] ERROR: Enrollment failed."
-    echo "[wazuh-agent] Most common cause: agent with the same name already exists on the manager."
-    echo "[wazuh-agent] Fix options:"
-    echo "[wazuh-agent]  1) Delete existing agent on manager (same name) and restart add-on"
-    echo "[wazuh-agent]  2) Change agent_name in add-on config"
+  # agent-auth typically writes to /var/ossec/etc/client.keys
+  if [ -s "$KEYS" ]; then
+    # since $KEYS is symlink -> persisted, this should already be persisted,
+    # but we keep this message to confirm
+    echo "[wazuh-agent] Enrollment complete; client.keys persisted"
+  else
+    echo "[wazuh-agent] ERROR: Enrollment reported success but client.keys is still missing/empty."
     exit 1
   fi
-
-  if [ ! -s "$KEYS" ]; then
-    echo "[wazuh-agent] ERROR: Enrollment succeeded but $KEYS is empty/missing (unexpected)."
-    exit 1
-  fi
-
-  # Copy keys to persistent storage
-  cp -f "$KEYS" "$PERSIST_KEYS"
-  chmod 600 "$PERSIST_KEYS" || true
-
-  # Replace with symlink for future runs
-  rm -f "$KEYS"
-  ln -s "$PERSIST_KEYS" "$KEYS"
-
-  echo "[wazuh-agent] Enrollment complete; client.keys persisted"
+else
+  echo "[wazuh-agent] Persisted client.keys exists; skipping enrollment"
 fi
 
-# -----------------------------
+# ----------------------------
+# CRITICAL FIX: Disable auto-enrollment in ossec.conf
+# Otherwise wazuh-agentd will try to enroll again WITHOUT password
+# (and with container hostname like 7fff8b0f-wazuh-agent)
+# ----------------------------
+if grep -q "<enrollment>" "$CONF"; then
+  echo "[wazuh-agent] Disabling auto-enrollment block in ossec.conf"
+  awk '
+    BEGIN{skip=0}
+    /<enrollment>/{skip=1; next}
+    /<\/enrollment>/{skip=0; next}
+    { if(!skip) print }
+  ' "$CONF" > /tmp/ossec.conf && mv /tmp/ossec.conf "$CONF"
+fi
+
+# ----------------------------
 # Start agent
-# -----------------------------
+# ----------------------------
 echo "[wazuh-agent] Starting agent"
- /var/ossec/bin/wazuh-control start || true
+/var/ossec/bin/wazuh-control restart || /var/ossec/bin/wazuh-control start || true
 
 echo "[wazuh-agent] Status:"
 /var/ossec/bin/wazuh-control status || true
