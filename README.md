@@ -1,6 +1,12 @@
 # HA Wazuh Agent Add-on
 
-Security logging and host visibility for Home Assistant using Wazuh.
+Security logging and host visibility for Home Assistant using **Wazuh**.
+
+This Home Assistant add-on runs a **Wazuh Agent** inside HA OS and forwards
+structured security-relevant events to a **Wazuh Manager**.
+
+Primary goal: **as native as possible** for any Home Assistant installation —
+no HA-side custom integrations required.
 
 ---
 
@@ -39,27 +45,27 @@ There is currently no native:
 - Compliance-style baseline checks
 - Long-term security event correlation
 
-This add-on enables Home Assistant to act like a monitored system within a broader security architecture.
+This add-on enables Home Assistant to act as a **monitored system** inside a broader security architecture.
 
 ---
 
 ## Architectural Motivation
 
-This add-on directly relates to the architectural discussion:
+This add-on directly relates to the Home Assistant architectural discussion:
 
-👉 https://github.com/home-assistant/architecture/discussions/1346
+https://github.com/home-assistant/architecture/discussions/1346
 
-That proposal explores improving structured security logging inside Home Assistant.
+That proposal explores improving structured security logging inside Home Assistant core.
 
-Until native security telemetry is standardized in HA core, this add-on provides:
+Until native security telemetry is standardized, this add-on provides:
 
 - Immediate structured log forwarding
 - Security event classification
 - Optional baseline security assessment (SCA)
 - Centralized monitoring through Wazuh
 
-It is not meant to replace future HA-native security logging —  
-but to provide a production-ready solution today.
+This add-on does **not** replace future HA-native security logging.
+It provides a **production-ready solution today**.
 
 ---
 
@@ -96,34 +102,80 @@ You can see:
 - Baseline configuration scoring (SCA)
 - Event correlation with other infrastructure
 
-<img width="1597" height="898" alt="image" src="https://github.com/user-attachments/assets/fbb9f901-ae09-4563-8b36-2a25d44387f5" />
+Screenshot:
+https://github.com/user-attachments/assets/fbb9f901-ae09-4563-8b36-2a25d44387f5
 
 ---
 
-## Who Is This For?
+## Architecture Overview
 
-This add-on is useful if you:
-
-- Run Home Assistant in a production-like environment
-- Care about security visibility
-- Already use Wazuh or want to
-- Operate a homelab with centralized logging
-- Want to experiment with structured HA security telemetry
-
-It may not be necessary for:
-
-- Small single-device hobby setups
-- Air-gapped non-networked deployments
+Home Assistant OS  
+→ HA Wazuh Agent (Add-on)  
+→ Encrypted TCP (1514)  
+→ Wazuh Manager  
+→ Wazuh Indexer / Dashboard
 
 ---
 
-## What You Get
+## Security Profiles
 
-- ✅ Wazuh Agent enrolled to your manager
-- ✅ Structured HA log forwarding
-- ✅ Persistent enrollment keys (`/data/ossec/etc/client.keys`)
-- ✅ Optional minimal-noise security profile
-- ✅ Clean restart behavior
-- ✅ Production-grade configuration validation
+### Minimal (default)
+
+Designed specifically for Home Assistant OS.
+
+- Disables:
+  - syscheck (FIM)
+  - rootcheck
+  - syscollector
+  - agent-upgrade
+  - command collectors (df, netstat, last)
+- Keeps:
+  - Log forwarding
+  - Security Configuration Assessment (SCA)
+
+Minimal mode focuses on **telemetry and visibility**, not host scanning.
 
 ---
+
+### Standard
+
+For advanced users.
+
+- Enables default Wazuh modules
+- Performs file integrity monitoring
+- Behaves like a traditional Linux agent
+
+Use only if you understand HA OS container constraints.
+
+---
+
+## Threat Model
+
+This add-on improves visibility, not immunity.
+
+It helps detect:
+
+- Service crashes and restarts
+- Suspicious log patterns
+- Authentication anomalies
+- Configuration drift
+- Cross-infrastructure attack signals
+
+It does not prevent:
+
+- Zero-day vulnerabilities
+- Physical access attacks
+- Compromise of Wazuh Manager
+
+Security is layered.
+
+---
+
+## License & Upstream Notice
+
+This project is licensed under the **MIT License**.
+
+It installs and runs the official **Wazuh Agent**, which is licensed under **GPLv2**.
+
+This add-on does not modify or redistribute Wazuh source code.
+All trademarks belong to their respective owners.
