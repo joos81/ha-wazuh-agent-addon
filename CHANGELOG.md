@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.0.1](https://github.com/BeardedTinker/ha-wazuh-agent-addon/compare/v1.0.0...v1.0.1) (2026-03-04)
+
+
+### Bug Fixes
+
+* change where changelog is located for HA Addon ([7602d7f](https://github.com/BeardedTinker/ha-wazuh-agent-addon/commit/7602d7fd343bfc749042541a88915bb4555f9edc))
+* content was overwritten ([0aba0ae](https://github.com/BeardedTinker/ha-wazuh-agent-addon/commit/0aba0aefa7e0ef7d515fecda1667a90530e39452))
+* Error with path ([2aace31](https://github.com/BeardedTinker/ha-wazuh-agent-addon/commit/2aace3182f1d3ad69bdb3de742ffb6aa196b1827))
+* trying to get journal access ([9905f8e](https://github.com/BeardedTinker/ha-wazuh-agent-addon/commit/9905f8e8de756a94c13a928b9272683acb5695a2))
+* trying to get journal access ([8e9290e](https://github.com/BeardedTinker/ha-wazuh-agent-addon/commit/8e9290ed267af35ba0a0fa8ca8196285053ca341))
+* Underscore is wrong ([fef40e0](https://github.com/BeardedTinker/ha-wazuh-agent-addon/commit/fef40e04ee1699a1c2ddc9ed040f8db7c5d4b26e))
+
 ## [1.0.2](https://github.com/BeardedTinker/ha-wazuh-agent-addon/compare/ha-wazuh-agent-addon-v1.0.1...ha-wazuh-agent-addon-v1.0.2) (2026-03-04)
 ## 1.0.0 (2026-03-04)
 
