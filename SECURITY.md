@@ -1,25 +1,32 @@
 # Security Policy
 
-## Reporting Vulnerabilities
+## Supported Versions
 
-If you discover a security issue:
+Only the **latest release** is supported.
 
-- Do NOT open a public GitHub issue
-- Contact the maintainer directly
-- Provide reproduction details if possible
+## Reporting a Vulnerability
 
-## Scope
+Please **do not** open a public GitHub issue for security reports.
 
-This project:
-- Does not expose inbound network services
-- Does not execute remote commands in minimal mode
-- Relies on upstream Wazuh security
+Use one of these options:
 
-## Dependencies
+1) **GitHub Security Advisories (preferred)**
+   - Go to the repository → **Security** → **Advisories** → **New draft security advisory**
+   - Or enable “Private vulnerability reporting” in repository settings.
 
-Security of this project depends on:
-- Home Assistant OS
-- Wazuh Agent
-- Wazuh Manager configuration
+2) Email (fallback)
+   - Contact: inquiry@beardedtinker.com
+   - Subject: `[SECURITY] ha-wazuh-agent-addon`
 
-Keep your system updated.
+Include:
+- affected version
+- reproduction steps (if possible)
+- logs/screenshots with sensitive data removed
+- proposed fix/mitigation (if you have one)
+
+## Disclosure
+
+We follow responsible disclosure:
+- acknowledge receipt
+- work on a fix
+- publish a release note when patched
