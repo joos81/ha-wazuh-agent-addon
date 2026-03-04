@@ -3,6 +3,7 @@ name: Release Please
 on:
   push:
     branches: [ main ]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -12,10 +13,8 @@ jobs:
   release-please:
     runs-on: ubuntu-latest
     steps:
-      - uses: googleapis/release-please-action@v4
+      - name: Run release-please
+        uses: googleapis/release-please-action@v4
         with:
-          release-type: simple
-          package-name: ha-wazuh-agent-addon
-          # Version file list:
-          extra-files: |
-            config.yaml
+          config-file: .release-please-config.json
+          manifest-file: release-please-manifest.json
