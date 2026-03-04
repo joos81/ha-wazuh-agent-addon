@@ -14,6 +14,9 @@ PERSIST_KEYS="${PERSIST_DIR}/client.keys"
 
 LOGFILE="/config/home-assistant.log"
 
+MACHINE_ID_FILE="/data/machine-id"
+JOURNAL_ROOT="/var/log/journal"
+
 # ----------------------------
 # Helpers
 # ----------------------------
@@ -166,6 +169,59 @@ if [[ ! -x /var/ossec/bin/wazuh-control ]] || [[ ! -f "$CONF" ]]; then
   log "ERROR: Wazuh agent not present. Rebuild image (Dockerfile installs wazuh-agent)."
   exit 1
 fi
+
+# ----------------------------
+# Ensure /etc/machine-id exists (needed for journald in containers)
+# Persist it in /data/machine-id so it survives addon reinstall/restart.
+# ----------------------------
+ensure_machine_id() {
+  # If already present, nothing to do
+  if [[ -s /etc/machine-id ]]; then
+    log "/etc/machine-id exists"
+    return 0
+  fi
+
+  mkdir -p /data
+
+  # 1) If we already have persisted machine-id, use it
+  if [[ -s "$MACHINE_ID_FILE" ]]; then
+    log "Restoring /etc/machine-id from $MACHINE_ID_FILE"
+    install -m 0444 -o root -g root "$MACHINE_ID_FILE" /etc/machine-id
+    return 0
+  fi
+
+  # 2) Try infer from journald directory name: /var/log/journal/<machineid>
+  local inferred=""
+  if [[ -d "$JOURNAL_ROOT" ]]; then
+    inferred="$(find "$JOURNAL_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' \
+      | grep -E '^[0-9a-f]{32}$' | head -n 1 || true)"
+  fi
+
+  if [[ -n "$inferred" ]]; then
+    log "Inferred machine-id from journald dir: $inferred"
+    echo "$inferred" > "$MACHINE_ID_FILE"
+    chmod 0444 "$MACHINE_ID_FILE" || true
+    install -m 0444 -o root -g root "$MACHINE_ID_FILE" /etc/machine-id
+    return 0
+  fi
+
+  # 3) Fallback: generate new 32-hex id
+  local gen=""
+  if command -v openssl >/dev/null 2>&1; then
+    gen="$(openssl rand -hex 16)"
+  else
+    gen="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  fi
+
+  log "Generated new machine-id: $gen"
+  echo "$gen" > "$MACHINE_ID_FILE"
+  chmod 0444 "$MACHINE_ID_FILE" || true
+  install -m 0444 -o root -g root "$MACHINE_ID_FILE" /etc/machine-id
+}
+
+ensure_machine_id
+
+log "machine-id: $(head -c 32 /etc/machine-id 2>/dev/null || echo missing)"
 
 # ----------------------------
 # Persisted keys handling (copy, not symlink)
