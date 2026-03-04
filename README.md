@@ -1,3 +1,7 @@
+![GitHub Release](https://img.shields.io/github/v/release/BeardedTinker/ha-wazuh-agent-addon)
+![License](https://img.shields.io/github/license/BeardedTinker/ha-wazuh-agent-addon)
+![Build](https://img.shields.io/github/actions/workflow/status/BeardedTinker/ha-wazuh-agent-addon/build-addon.yml)
+
 # HA Wazuh Agent Add-on
 
 Security logging and host visibility for **Home Assistant OS** using **Wazuh**.
