@@ -1,5 +1,7 @@
 {
   "release-type": "simple",
+  "changelog-path": "wazuh-agent/CHANGELOG.md",
+  "bump-minor-pre-major": true,
   "packages": {
     ".": {
       "package-name": "ha-wazuh-agent-addon",
